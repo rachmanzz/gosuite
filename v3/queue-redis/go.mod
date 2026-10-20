@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.27.2
 
 require (
-	github.com/rachmanzz/gosuite/v3/queue v0.2.0
+	github.com/rachmanzz/gosuite/v3/queue v0.2.3
 	github.com/redis/go-redis/v9 v9.23.0
 )
 
