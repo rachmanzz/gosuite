@@ -119,4 +119,3 @@ func TestRedisDriver_ErrDeliveryLostExported(t *testing.T) {
 		t.Fatalf("expected queueredis.ErrDeliveryLost to alias queue.ErrDeliveryLost")
 	}
 }
-
