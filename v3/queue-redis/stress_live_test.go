@@ -110,7 +110,7 @@ func newStressDriver(t *testing.T, lease time.Duration) (*queueredis.RedisDriver
 	t.Cleanup(func() {
 		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores").Err()
+		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores", prefix+"inflight_claims").Err()
 		_ = client.Close()
 	})
 	return driver, client, prefix

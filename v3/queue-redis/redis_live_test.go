@@ -83,7 +83,7 @@ func TestRedisDriver_Live(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer ccancel()
-		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores").Err()
+		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores", prefix+"inflight_claims").Err()
 	})
 
 	low := newLiveMsg("email.send", queue.PriorityLow)
@@ -190,7 +190,7 @@ func TestRedisDriver_Live_PrioritySurvivesNack(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer ccancel()
-		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores").Err()
+		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores", prefix+"inflight_claims").Err()
 	})
 
 	def := newLiveMsg("invoice.settle", queue.PriorityDefault)
@@ -255,7 +255,7 @@ func TestRedisDriver_Live_NackPreservesFIFOPosition(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer ccancel()
-		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores").Err()
+		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores", prefix+"inflight_claims").Err()
 	})
 
 	// The zset score ties FIFO to whole seconds (CreatedAt.Unix()), so separate
@@ -312,7 +312,7 @@ func TestRedisDriver_Live_InFlightRedeliveredAfterLease(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer ccancel()
-		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores").Err()
+		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores", prefix+"inflight_claims").Err()
 	})
 
 	msg := newLiveMsg("lease.redeliver", queue.PriorityDefault)
@@ -385,7 +385,7 @@ func TestRedisDriver_Live_ReclaimPreservesPriority(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer ccancel()
-		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores").Err()
+		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores", prefix+"inflight_claims").Err()
 	})
 
 	// Two HIGH messages one second apart so their ready scores (priority*1e9 -
@@ -455,7 +455,7 @@ func TestRedisDriver_Live_UndecodablePayloadBecomesPoison(t *testing.T) {
 	t.Cleanup(func() {
 		cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer ccancel()
-		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores").Err()
+		_ = client.Del(cctx, prefix+"priority_zset", prefix+"messages_hash", prefix+"delayed_zset", prefix+"inflight_zset", prefix+"inflight_scores", prefix+"inflight_claims").Err()
 	})
 
 	// Case 1a: v2 record present but its metadata field is corrupt.
@@ -503,5 +503,104 @@ func TestRedisDriver_Live_UndecodablePayloadBecomesPoison(t *testing.T) {
 	}
 	if batch2[0].Message == nil || batch2[0].Message.Topic != queue.PoisonTopic || batch2[0].Message.ID != missing.ID {
 		t.Fatalf("queue-redis: missing-entry poison malformed: %+v", batch2[0].Message)
+	}
+}
+
+// A legacy ID must not settle a newer worker's claim for that same message.
+func TestRedisDriver_Live_LeaseLessTokenCannotModifyNewClaim(t *testing.T) {
+	addr := os.Getenv("TEST_REDIS_ADDR")
+	if addr == "" {
+		t.Skip("TEST_REDIS_ADDR not set")
+	}
+	client := redis.NewClient(&redis.Options{Addr: addr})
+	defer client.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	prefix := "fiber:queue:claim:" + randSuffix(t) + ":"
+	keys := []string{prefix + "priority_zset", prefix + "messages_hash", prefix + "delayed_zset", prefix + "inflight_zset", prefix + "inflight_scores", prefix + "inflight_claims"}
+	defer client.Del(context.Background(), keys...)
+	oldDriver := queueredis.New(client, queueredis.WithPrefix(prefix), queueredis.WithVisibilityTimeout(100*time.Millisecond))
+	currentDriver := queueredis.New(client, queueredis.WithPrefix(prefix), queueredis.WithVisibilityTimeout(10*time.Second))
+	original := queue.NewMessage("claim.job", []byte("original payload"))
+	if err := oldDriver.Enqueue(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	old := dequeueUntil(t, ctx, oldDriver, time.Second, 1)
+	if len(old) != 1 {
+		t.Fatal("initial claim missing")
+	}
+	time.Sleep(150 * time.Millisecond)
+	current := dequeueUntil(t, ctx, currentDriver, time.Second, 1)
+	if len(current) != 1 || current[0].Message.ID != original.ID {
+		t.Fatal("new worker did not reclaim message")
+	}
+	snapshot := func() []string {
+		t.Helper()
+		out := make([]string, len(keys))
+		for i, key := range keys {
+			v, err := client.Dump(ctx, key).Result()
+			if err != nil && err != redis.Nil {
+				t.Fatal(err)
+			}
+			out[i] = v
+		}
+		return out
+	}
+	before := snapshot()
+	changed := *original
+	changed.Payload = []byte("must not replace payload")
+	changed.Attempt = 7
+	for _, token := range []struct {
+		name  string
+		value any
+		stale bool
+	}{
+		{"legacy ID", original.ID, false}, {"stale lease", old[0].Token, true},
+	} {
+		d := &queue.Delivery{Message: original, Token: token.value}
+		for _, op := range []struct {
+			name string
+			run  func() error
+		}{
+			{"Ack", func() error { return oldDriver.Ack(ctx, d) }},
+			{"Nack", func() error { return oldDriver.Nack(ctx, d, errors.New("old worker")) }},
+			{"Reenqueue", func() error { return oldDriver.Reenqueue(ctx, d, &changed, time.Now().Add(time.Minute)) }},
+		} {
+			t.Run(token.name+"/"+op.name, func(t *testing.T) {
+				err := op.run()
+				if err == nil {
+					t.Fatal("unauthorized claim accepted")
+				}
+				if token.stale && !errors.Is(err, queueredis.ErrDeliveryLost) {
+					t.Fatalf("stale claim error: %v", err)
+				}
+				after := snapshot()
+				for i := range keys {
+					if before[i] != after[i] {
+						t.Fatalf("claim/payload/index modified: %s", keys[i])
+					}
+				}
+			})
+		}
+	}
+	// The current worker still owns its token and can complete normal settlement.
+	if err := currentDriver.Nack(ctx, current[0], nil); err != nil {
+		t.Fatal(err)
+	}
+	next := dequeueUntil(t, ctx, currentDriver, time.Second, 1)
+	if len(next) != 1 {
+		t.Fatal("valid Nack did not requeue")
+	}
+	retry := *next[0].Message
+	retry.Attempt = 1
+	if err := currentDriver.Reenqueue(ctx, next[0], &retry, time.Now().Add(30*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	ready := dequeueUntil(t, ctx, currentDriver, time.Second, 1)
+	if len(ready) != 1 || ready[0].Message.Attempt != 1 || string(ready[0].Message.Payload) != string(original.Payload) {
+		t.Fatal("valid retry corrupted")
+	}
+	if err := currentDriver.Ack(ctx, ready[0]); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/rachmanzz/gosuite/v3/queue"
@@ -22,22 +23,26 @@ var ErrDeliveryLost = queue.ErrDeliveryLost
 type deliveryClaim struct {
 	id    string
 	lease float64
+	owner string
 }
 
-func parseDeliveryClaim(tok any) (string, float64, error) {
+func parseDeliveryClaim(tok any) (string, string, error) {
+	var claim deliveryClaim
 	switch t := tok.(type) {
 	case deliveryClaim:
-		return t.id, t.lease, nil
+		claim = t
 	case *deliveryClaim:
 		if t == nil {
-			return "", 0, fmt.Errorf("queue-redis: nil delivery claim")
+			return "", "", fmt.Errorf("queue-redis: nil delivery claim")
 		}
-		return t.id, t.lease, nil
-	case string:
-		return t, 0, nil
+		claim = *t
 	default:
-		return "", 0, fmt.Errorf("queue-redis: invalid delivery token type: %T", tok)
+		return "", "", fmt.Errorf("queue-redis: invalid delivery token type: %T", tok)
 	}
+	if claim.id == "" || claim.owner == "" || claim.lease <= 0 || math.IsNaN(claim.lease) || math.IsInf(claim.lease, 0) {
+		return "", "", fmt.Errorf("queue-redis: invalid delivery claim")
+	}
+	return claim.id, claim.owner, nil
 }
 
 // DefaultPrefix is the default key prefix for Redis queue data structures.
@@ -233,6 +238,12 @@ func (r *RedisDriver) inflightScoreKey() string {
 	return r.prefix + "inflight_scores"
 }
 
+// inflightClaimKey stores an opaque acquisition identity independently of expiry.
+// Each new acquisition overwrites the identity; settlement must match it exactly.
+func (r *RedisDriver) inflightClaimKey() string {
+	return r.prefix + "inflight_claims"
+}
+
 // popToInflight atomically moves up to N highest-priority members from the ready
 // ZSet into the in-flight ZSet stamped with the lease score. Doing the pop and
 // lease-stamp in one script closes the window where a crash between the two
@@ -246,13 +257,14 @@ for i = 1, #items, 2 do
   local score = items[i+1]
   redis.call('ZADD', KEYS[2], ARGV[2], member)
   redis.call('HSET', KEYS[3], member, score)
+  redis.call('HSET', KEYS[4], member, ARGV[3] .. ':' .. member)
   out[#out+1] = member
 end
 return out
 `)
 
 // ackInflightScript atomically checks that the message is still in the in-flight ZSet
-// (and matches the lease deadline if provided) before deleting it from the hash
+// and matches the acquisition identity exactly before deleting it from the hash
 // and clearing the in-flight lease. If the lease expired and the message was reclaimed
 // (or claimed by another worker), it aborts and returns 0 without touching the message hash.
 var ackInflightScript = redis.NewScript(`
@@ -260,16 +272,14 @@ local currentLease = redis.call('ZSCORE', KEYS[2], ARGV[1])
 if not currentLease then
   return 0
 end
-if ARGV[2] ~= '' and ARGV[2] ~= '0' then
-  local expected = tonumber(ARGV[2])
-  local actual = tonumber(currentLease)
-  if not expected or not actual or math.abs(actual - expected) > 0.001 then
-    return 0
-  end
+local owner = redis.call('HGET', KEYS[4], ARGV[1])
+if ARGV[2] == '' or not owner or owner ~= ARGV[2] then
+  return 0
 end
 redis.call('HDEL', KEYS[1], ARGV[1]..':p', ARGV[1]..':m')
 redis.call('ZREM', KEYS[2], ARGV[1])
 redis.call('HDEL', KEYS[3], ARGV[1])
+redis.call('HDEL', KEYS[4], ARGV[1])
 return 1
 `)
 
@@ -281,15 +291,13 @@ local currentLease = redis.call('ZSCORE', KEYS[2], ARGV[2])
 if not currentLease then
   return 0
 end
-if ARGV[3] ~= '' and ARGV[3] ~= '0' then
-  local expected = tonumber(ARGV[3])
-  local actual = tonumber(currentLease)
-  if not expected or not actual or math.abs(actual - expected) > 0.001 then
-    return 0
-  end
+local owner = redis.call('HGET', KEYS[4], ARGV[2])
+if ARGV[3] == '' or not owner or owner ~= ARGV[3] then
+  return 0
 end
 redis.call('ZREM', KEYS[2], ARGV[2])
 redis.call('HDEL', KEYS[3], ARGV[2])
+redis.call('HDEL', KEYS[4], ARGV[2])
 redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
 return 1
 `)
@@ -301,37 +309,32 @@ local currentLease = redis.call('ZSCORE', KEYS[2], ARGV[2])
 if not currentLease then
   return 0
 end
-if ARGV[3] ~= '' and ARGV[3] ~= '0' then
-  local expected = tonumber(ARGV[3])
-  local actual = tonumber(currentLease)
-  if not expected or not actual or math.abs(actual - expected) > 0.001 then
-    return 0
-  end
+local owner = redis.call('HGET', KEYS[5], ARGV[2])
+if ARGV[3] == '' or not owner or owner ~= ARGV[3] then
+  return 0
 end
 redis.call('ZREM', KEYS[2], ARGV[2])
 redis.call('HDEL', KEYS[3], ARGV[2])
+redis.call('HDEL', KEYS[5], ARGV[2])
 redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
 redis.call('HSET', KEYS[4], ARGV[2]..':p', ARGV[4], ARGV[2]..':m', ARGV[5])
 return 1
 `)
 
-
-// migrateDelayedScript atomically migrates matured delayed members to the
-// ready ZSet. For each (member, score) argument it first ZREMs the member from
-// the delayed set and only ZADDs it to the ready set when that removal actually
-// happened. This makes concurrent migrations safe: when two Dequeue calls both
-// observe the same matured member, exactly one of them removes it (ZREM
-// returns 1) and therefore exactly one copy ever reaches the ready set. The
-// previous two-step implementation (ZRangeByScore -> TxPipeline ZRem+ZAdd)
-// allowed a second, overlapping migration to re-add a member that had already
-// been popped, delivered and Acked -- whose hash entry was then already gone
-// -- producing a duplicate delivery followed by a poison "missing payload".
+// migrateDelayedScript moves only records still due with the metadata observed
+// when computing their ready score. A concurrent same-ID replacement may have
+// changed the due time or priority; leave it for a fresh poll in that case.
+// The conditional removal prevents overlapping migrations from re-adding an
+// already claimed or settled message.
 var migrateDelayedScript = redis.NewScript(`
 local out = {}
-for i = 1, #ARGV, 2 do
+for i = 2, #ARGV, 3 do
   local member = ARGV[i]
   local score = ARGV[i+1]
-  if redis.call('ZREM', KEYS[1], member) == 1 then
+  local due = redis.call('ZSCORE', KEYS[1], member)
+  local meta = redis.call('HGET', KEYS[3], member..':m') or ''
+  if due and tonumber(due) <= tonumber(ARGV[1]) and meta == ARGV[i+2] then
+    redis.call('ZREM', KEYS[1], member)
     redis.call('ZADD', KEYS[2], score, member)
     out[#out+1] = member
   end
@@ -355,6 +358,7 @@ for i = 1, #expired do
   end
   redis.call('ZADD', KEYS[1], score, member)
   redis.call('HDEL', KEYS[3], member)
+  redis.call('HDEL', KEYS[4], member)
   redis.call('ZREM', KEYS[2], member)
   out[#out+1] = member
 end
@@ -368,7 +372,7 @@ return out
 func (r *RedisDriver) reclaimExpired(ctx context.Context, nowScore float64) error {
 	defaultScore := float64(queue.PriorityDefault)*1e9 - nowScore
 	err := reclaimExpiredScript.Run(ctx, r.client,
-		[]string{r.queueKey(), r.inflightKey(), r.inflightScoreKey()},
+		[]string{r.queueKey(), r.inflightKey(), r.inflightScoreKey(), r.inflightClaimKey()},
 		fmt.Sprintf("%f", nowScore), defaultScore,
 	).Err()
 	if err == redis.Nil {
@@ -377,8 +381,20 @@ func (r *RedisDriver) reclaimExpired(ctx context.Context, nowScore float64) erro
 	return err
 }
 
-// enqueue writes the v2 split record (raw payload + msgpack metadata) into the
-// message hash and adds the message to the given ZSet with the given score.
+// replacePublicationScript implements last-write-wins for one logical ID.
+// Invalidate its old claim and remove the opposite schedule atomically with
+// storing the replacement, so old settlement cannot delete newer payloads.
+var replacePublicationScript = redis.NewScript(`
+redis.call('HSET', KEYS[3], ARGV[1]..':p', ARGV[3], ARGV[1]..':m', ARGV[4])
+redis.call('ZREM', KEYS[2], ARGV[1])
+redis.call('ZREM', KEYS[4], ARGV[1])
+redis.call('HDEL', KEYS[5], ARGV[1])
+redis.call('HDEL', KEYS[6], ARGV[1])
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+return 1
+`)
+
+// enqueue atomically replaces a publication and invalidates any old claim.
 func (r *RedisDriver) enqueue(ctx context.Context, msg *queue.Message, key string, score float64) error {
 	if msg == nil {
 		return ErrNilMessage
@@ -392,13 +408,13 @@ func (r *RedisDriver) enqueue(ctx context.Context, msg *queue.Message, key strin
 		payload = []byte{}
 	}
 
-	pipe := r.client.Pipeline()
-	pipe.HSet(ctx, r.dataKey(),
-		payloadField(msg.ID), payload,
-		metaField(msg.ID), meta,
-	)
-	pipe.ZAdd(ctx, key, redis.Z{Score: score, Member: msg.ID})
-	_, err = pipe.Exec(ctx)
+	opposite := r.queueKey()
+	if key == r.queueKey() {
+		opposite = r.delayedKey()
+	}
+	_, err = replacePublicationScript.Run(ctx, r.client,
+		[]string{key, opposite, r.dataKey(), r.inflightKey(), r.inflightScoreKey(), r.inflightClaimKey()},
+		msg.ID, score, payload, meta).Result()
 	return err
 }
 
@@ -465,33 +481,40 @@ func (r *RedisDriver) Dequeue(ctx context.Context, req queue.DequeueRequest) ([]
 		if err != nil && err != redis.Nil {
 			return nil, err
 		}
-		args := make([]interface{}, 0, len(delayedMembers)*2)
+		args := make([]interface{}, 1, 1+len(delayedMembers)*3)
+		args[0] = fmt.Sprintf("%f", nowScore)
 		for i, mID := range delayedMembers {
 			score := float64(queue.PriorityDefault)*1e9 - nowScore
+			var expectedMeta []byte
 			if i < len(raws) {
 				if metaRaw := rawValue(raws[i]); metaRaw != nil {
+					expectedMeta = metaRaw
 					if meta, err := decodeMeta(metaRaw); err == nil {
 						score = float64(meta.Priority)*1e9 - float64(meta.CreatedAt.Unix())
 					}
 				}
 			}
-			args = append(args, mID, fmt.Sprintf("%f", score))
+			if expectedMeta == nil {
+				expectedMeta = []byte{}
+			}
+			args = append(args, mID, fmt.Sprintf("%f", score), expectedMeta)
 		}
 		// The migration is conditional on the ZREM (see migrateDelayedScript):
 		// an overlapping migration that lost the race contributes nothing, so
 		// a member can never be re-added to the ready set after it was
 		// already delivered and Acked.
 		if _, err := migrateDelayedScript.Run(ctx, r.client,
-			[]string{r.delayedKey(), r.queueKey()}, args...).Result(); err != nil {
+			[]string{r.delayedKey(), r.queueKey(), r.dataKey()}, args...).Result(); err != nil {
 			return nil, err
 		}
 	}
 
 	// 2. Atomically pop highest-priority members into the in-flight ZSet with a lease.
 	leaseScore := float64(now.Add(r.lease).UnixNano()) / 1e9
+	claimOwner := queue.NewUUID()
 	res, err := popToInflightScript.Run(ctx, r.client,
-		[]string{r.queueKey(), r.inflightKey(), r.inflightScoreKey()},
-		batchSize, leaseScore).Result()
+		[]string{r.queueKey(), r.inflightKey(), r.inflightScoreKey(), r.inflightClaimKey()},
+		batchSize, leaseScore, claimOwner).Result()
 	if err != nil {
 		if err == redis.Nil {
 			return nil, nil
@@ -535,7 +558,7 @@ func (r *RedisDriver) Dequeue(ctx context.Context, req queue.DequeueRequest) ([]
 			// dropping it.
 			deliveries = append(deliveries, &queue.Delivery{
 				Message: queue.NewPoisonMessage(msgID, nil, fmt.Errorf("queue-redis: missing payload for message id %q", msgID), r.Name()),
-				Token:   deliveryClaim{id: msgID, lease: leaseScore},
+				Token:   deliveryClaim{id: msgID, lease: leaseScore, owner: claimOwner + ":" + msgID},
 			})
 			continue
 		}
@@ -543,14 +566,14 @@ func (r *RedisDriver) Dequeue(ctx context.Context, req queue.DequeueRequest) ([]
 		if err != nil {
 			deliveries = append(deliveries, &queue.Delivery{
 				Message: queue.NewPoisonMessage(msgID, v2Payload, fmt.Errorf("queue-redis: corrupt metadata: %w", err), r.Name()),
-				Token:   deliveryClaim{id: msgID, lease: leaseScore},
+				Token:   deliveryClaim{id: msgID, lease: leaseScore, owner: claimOwner + ":" + msgID},
 			})
 			continue
 		}
 		msg := meta.toMessage(v2Payload)
 		deliveries = append(deliveries, &queue.Delivery{
 			Message: msg,
-			Token:   deliveryClaim{id: msg.ID, lease: leaseScore},
+			Token:   deliveryClaim{id: msgID, lease: leaseScore, owner: claimOwner + ":" + msgID},
 		})
 	}
 
@@ -567,7 +590,7 @@ func (r *RedisDriver) Reenqueue(ctx context.Context, d *queue.Delivery, msg *que
 	if msg == nil {
 		return ErrNilMessage
 	}
-	id, lease, err := parseDeliveryClaim(d.Token)
+	id, owner, err := parseDeliveryClaim(d.Token)
 	if err != nil {
 		return err
 	}
@@ -580,13 +603,9 @@ func (r *RedisDriver) Reenqueue(ctx context.Context, d *queue.Delivery, msg *que
 		payload = []byte{}
 	}
 	delayedScore := float64(at.UnixNano()) / 1e9
-	leaseArg := ""
-	if lease > 0 {
-		leaseArg = fmt.Sprintf("%.6f", lease)
-	}
 	res, err := reenqueueInflightScript.Run(ctx, r.client,
-		[]string{r.delayedKey(), r.inflightKey(), r.inflightScoreKey(), r.dataKey()},
-		delayedScore, id, leaseArg, payload, meta).Int64()
+		[]string{r.delayedKey(), r.inflightKey(), r.inflightScoreKey(), r.dataKey(), r.inflightClaimKey()},
+		delayedScore, id, owner, payload, meta).Int64()
 	if err != nil {
 		return err
 	}
@@ -603,17 +622,13 @@ func (r *RedisDriver) Ack(ctx context.Context, d *queue.Delivery) error {
 	if d == nil || d.Token == nil {
 		return nil
 	}
-	id, lease, err := parseDeliveryClaim(d.Token)
+	id, owner, err := parseDeliveryClaim(d.Token)
 	if err != nil {
 		return err
 	}
-	leaseArg := ""
-	if lease > 0 {
-		leaseArg = fmt.Sprintf("%.6f", lease)
-	}
 	res, err := ackInflightScript.Run(ctx, r.client,
-		[]string{r.dataKey(), r.inflightKey(), r.inflightScoreKey()},
-		id, leaseArg).Int64()
+		[]string{r.dataKey(), r.inflightKey(), r.inflightScoreKey(), r.inflightClaimKey()},
+		id, owner).Int64()
 	if err != nil {
 		return err
 	}
@@ -629,7 +644,7 @@ func (r *RedisDriver) Nack(ctx context.Context, d *queue.Delivery, reason error)
 	if d == nil || d.Token == nil {
 		return nil
 	}
-	id, lease, err := parseDeliveryClaim(d.Token)
+	id, owner, err := parseDeliveryClaim(d.Token)
 	if err != nil {
 		return err
 	}
@@ -642,13 +657,9 @@ func (r *RedisDriver) Nack(ctx context.Context, d *queue.Delivery, reason error)
 		}
 	}
 	score := float64(prio)*1e9 - float64(createdAt.Unix())
-	leaseArg := ""
-	if lease > 0 {
-		leaseArg = fmt.Sprintf("%.6f", lease)
-	}
 	res, err := nackInflightScript.Run(ctx, r.client,
-		[]string{r.queueKey(), r.inflightKey(), r.inflightScoreKey()},
-		score, id, leaseArg).Int64()
+		[]string{r.queueKey(), r.inflightKey(), r.inflightScoreKey(), r.inflightClaimKey()},
+		score, id, owner).Int64()
 	if err != nil {
 		return err
 	}

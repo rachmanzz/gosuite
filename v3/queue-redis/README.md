@@ -72,6 +72,25 @@ The default lease is `DefaultVisibilityTimeout` (30 seconds). Keep it comfortabl
 
 If a worker attempts to `Ack`, `Nack`, or `Reenqueue` a delivery whose lease has expired and was already reclaimed or settled, the driver safely aborts and returns `queueredis.ErrDeliveryLost` (aliased to canonical `queue.ErrDeliveryLost`).
 
+Delivery tokens returned by `Dequeue` are opaque and include a unique acquisition
+identity. Redis stores that identity separately from the lease deadline;
+settlement compares it exactly, so equal or nearby deadlines cannot authorize
+a token from an earlier claim.
+Pass them unchanged to `Ack`, `Nack`, and `Reenqueue`. Legacy string-only tokens
+and malformed claims are rejected before Redis I/O; reconstructing a token from
+a message ID is no longer supported.
+
+Publishing an existing message ID uses last-write-wins replacement. `Enqueue`
+and `EnqueueAt` atomically replace its payload and metadata, remove its previous
+ready/delayed schedule, and invalidate any in-flight claim. Old delivery tokens
+then return `ErrDeliveryLost` from `Ack`, `Nack`, and `Reenqueue`. A handler that
+already started may still finish its work; replacement does not cancel it.
+
+Upgrade all consumers sharing a Redis prefix together: stop older consumers
+before starting this version. Mixed versions are unsafe because older consumers
+do not check acquisition identities. Existing in-flight messages without an
+identity become claimable by this version after their visibility leases expire.
+
 ---
 
 ## 📄 License
